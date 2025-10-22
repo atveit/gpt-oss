@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from .config import ModelConfig
 from .model import Transformer
 from .loader_safetensors import WeightLoader
-from .loader_orbax import OrbaxWeightLoader
+from .loader_orbax import OrbaxWeightLoader, load_config_from_orbax
 from .kv_cache import KVCache
 
 
@@ -96,14 +96,22 @@ class TokenGenerator:
 
         checkpoint_path = Path(checkpoint)
 
-        # Load configuration
-        self.config = load_config_from_checkpoint(checkpoint_path)
-        self.max_context_length = max_context_length
-
-        # Detect checkpoint format and load weights
+        # Detect checkpoint format first (before trying to load config)
         checkpoint_format = detect_checkpoint_format(checkpoint_path)
         print(f"Loading JAX checkpoint ({checkpoint_format} format)...")
 
+        # Load configuration based on checkpoint format
+        if checkpoint_format == 'orbax':
+            # Orbax checkpoints typically don't have config.json
+            config_dict = load_config_from_orbax(str(checkpoint_path))
+            self.config = ModelConfig(**config_dict)
+        else:
+            # SafeTensors checkpoints have config.json
+            self.config = load_config_from_checkpoint(checkpoint_path)
+
+        self.max_context_length = max_context_length
+
+        # Load weights based on checkpoint format
         if checkpoint_format == 'orbax':
             loader = OrbaxWeightLoader(str(checkpoint_path))
             self.params = loader.load_params(

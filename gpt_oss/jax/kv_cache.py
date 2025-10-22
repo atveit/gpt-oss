@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from typing import Tuple
 from dataclasses import dataclass
+from jax.tree_util import register_pytree_node_class
 
 
 @jax.jit
@@ -40,6 +41,7 @@ def _extend_jit(
     return new_k, new_v
 
 
+@register_pytree_node_class
 @dataclass
 class KVCache:
     """Key-Value cache for efficient autoregressive generation.
@@ -48,6 +50,8 @@ class KVCache:
     during autoregressive generation. This provides:
     - O(n) complexity instead of O(n²)
     - Constant input shape (always 1 new token) → no recompilation
+
+    Registered as a JAX PyTree to enable JIT compilation with KV caches.
 
     Attributes:
         k: Key cache of shape [batch_size, max_ctx, n_kv_heads, d_head]
@@ -64,6 +68,25 @@ class KVCache:
     k: jnp.ndarray  # [batch_size, max_ctx, n_kv_heads, d_head]
     v: jnp.ndarray  # [batch_size, max_ctx, n_kv_heads, d_head]
     offset: int
+
+    def tree_flatten(self):
+        """Flatten KVCache into children (arrays) and auxiliary data (offset).
+
+        Required for JAX PyTree registration.
+        """
+        children = (self.k, self.v)
+        aux_data = self.offset
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        """Reconstruct KVCache from flattened representation.
+
+        Required for JAX PyTree registration.
+        """
+        k, v = children
+        offset = aux_data
+        return cls(k=k, v=v, offset=offset)
 
     @staticmethod
     def create(batch_size: int, max_ctx: int, n_kv_heads: int, d_head: int = 64) -> 'KVCache':
