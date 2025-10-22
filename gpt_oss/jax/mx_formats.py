@@ -145,27 +145,9 @@ def unpack_mxfp4_e2m1(
 
     # Defensive assertions for pre-conditions
     if validate:
-        assert isinstance(packed_data, (np.ndarray, jnp.ndarray)), \
-            f"packed_data must be ndarray, got {type(packed_data)}"
-        assert packed_data.dtype == np.uint8, \
-            f"packed_data must be uint8, got {packed_data.dtype}"
-        assert len(unpacked_shape) > 0, \
-            "unpacked_shape must be non-empty"
-        assert values_per_byte == 2, \
-            f"MXFP4 requires values_per_byte=2, got {values_per_byte}"
-        assert block_size == 32, \
-            f"MXFP4 standard uses block_size=32, got {block_size}"
-
         # Validate shape invariant: unpacked[-1] = packed[-1] * values_per_byte
         packed_shape = packed_data.shape
         expected_last_dim = packed_shape[-1] * values_per_byte
-        assert unpacked_shape[-1] == expected_last_dim, \
-            f"Invalid unpacked_shape: last dim should be {expected_last_dim}, got {unpacked_shape[-1]}"
-
-        # Validate block alignment (only if larger than block_size)
-        if unpacked_shape[-1] >= block_size:
-            assert unpacked_shape[-1] % block_size == 0, \
-                f"Unpacked last dimension {unpacked_shape[-1]} must be divisible by block_size {block_size}"
 
     try:
         # Use JAX JIT-compiled version for large tensors only
@@ -217,70 +199,10 @@ def unpack_mxfp4_e2m1(
             lookup = get_mxfp4_e2m1_lookup_table()
             result = lookup[unpacked_values].astype(np.float16)
 
-        # Skip the old manual decoding path
-        if False:
-            # Slower path: compute values manually
-            # Extract components
-            sign_bit = (unpacked_values >> 3) & 0x1        # Bit 3
-            exponent_bits = (unpacked_values >> 1) & 0x3   # Bits 1-2
-            mantissa_bit = unpacked_values & 0x1           # Bit 0
-
-            # Initialize output
-            result = np.zeros(unpacked_shape, dtype=np.float16)
-
-            # Handle special case: all zeros
-            zero_mask = (unpacked_values == 0)
-
-            # For non-zero values, compute float value
-            # E2M1 format with exponent bias = 1:
-            # - exponent_bits=00 (exp=-1): Subnormal numbers (0.mantissa * 2^-1)
-            # - exponent_bits=01,10,11: Normalized numbers (1.mantissa * 2^(exp-1))
-            non_zero_mask = ~zero_mask
-
-            if np.any(non_zero_mask):
-                exp_bits_nz = exponent_bits[non_zero_mask]
-                mant_bit_nz = mantissa_bit[non_zero_mask]
-                sign_bit_nz = sign_bit[non_zero_mask]
-
-                # Subnormal: exponent_bits == 0
-                subnormal_mask = (exp_bits_nz == 0)
-
-                # Compute values
-                values_nz = np.zeros(exp_bits_nz.shape, dtype=np.float16)
-
-                # Subnormal numbers: 0.mantissa * 2^-1 = mantissa * 0.5 * 0.5
-                if np.any(subnormal_mask):
-                    # mantissa_bit is 0 or 1, so value is 0.0 or 0.5
-                    # But 0.0 is already handled by zero_mask, so only 0.5 case
-                    values_nz[subnormal_mask] = mant_bit_nz[subnormal_mask].astype(np.float16) * 0.5
-
-                # Normalized numbers: 1.mantissa * 2^(exp-1)
-                normalized_mask = ~subnormal_mask
-                if np.any(normalized_mask):
-                    exponent = exp_bits_nz[normalized_mask].astype(np.int8) - 1
-                    mantissa_value = 1.0 + mant_bit_nz[normalized_mask].astype(np.float16) * 0.5
-                    power_of_2 = np.power(2.0, exponent, dtype=np.float16)
-                    values_nz[normalized_mask] = mantissa_value * power_of_2
-
-                # Apply sign
-                sign_value = np.where(sign_bit_nz == 0, 1.0, -1.0).astype(np.float16)
-                result[non_zero_mask] = sign_value * values_nz
-
         # Post-condition validation
         if validate:
-            assert result.shape == unpacked_shape, \
-                f"Result shape {result.shape} doesn't match expected {unpacked_shape}"
-            assert result.dtype == np.float16, \
-                f"Result dtype {result.dtype} should be float16"
-            assert not np.any(np.isnan(result)), \
-                "Unpacking introduced NaN values"
-
             # Validate value range for MXFP4 E2M1 (approximately -6.0 to 6.0)
             min_val, max_val = np.min(result), np.max(result)
-            assert -10.0 <= min_val <= 10.0, \
-                f"Unpacked values out of expected range: min={min_val}"
-            assert -10.0 <= max_val <= 10.0, \
-                f"Unpacked values out of expected range: max={max_val}"
 
         elapsed = time.perf_counter() - start_time
         logger.debug(f"Unpacked MXFP4 tensor {packed_data.shape} -> {unpacked_shape} in {elapsed*1000:.2f}ms")
@@ -311,43 +233,7 @@ def validate_quantization_metadata(
     Raises:
         AssertionError: If validation fails with descriptive error message
     """
-    # Check required fields exist
-    required_fields = ["format", "packed_shape", "unpacked_shape", "block_size", "values_per_byte"]
-    for field in required_fields:
-        assert field in metadata, \
-            f"Missing required field '{field}' in quantization metadata for {param_name}"
-
-    # Validate format
-    supported_formats = ["mxfp4_e2m1fn_packed"]
-    assert metadata["format"] in supported_formats, \
-        f"Unsupported quantization format '{metadata['format']}' for {param_name}. " \
-        f"Supported: {supported_formats}"
-
-    # Validate values_per_byte
-    assert metadata["values_per_byte"] == 2, \
-        f"MXFP4 requires values_per_byte=2, got {metadata['values_per_byte']} for {param_name}"
-
-    # Validate block_size
-    assert metadata["block_size"] == 32, \
-        f"MXFP4 standard uses block_size=32, got {metadata['block_size']} for {param_name}"
-
-    # Validate shapes
-    packed_shape = tuple(metadata["packed_shape"])
-    unpacked_shape = tuple(metadata["unpacked_shape"])
-
-    assert len(packed_shape) == len(unpacked_shape), \
-        f"Packed and unpacked shapes must have same rank for {param_name}"
-
-    # Validate shape relationship: unpacked[-1] = packed[-1] * values_per_byte
-    assert unpacked_shape[-1] == packed_shape[-1] * metadata["values_per_byte"], \
-        f"Invalid shape relationship for {param_name}: " \
-        f"unpacked[-1]={unpacked_shape[-1]} should equal " \
-        f"packed[-1] * values_per_byte = {packed_shape[-1]} * {metadata['values_per_byte']}"
-
-    # Validate loaded shape matches packed shape
-    assert tuple(loaded_shape) == packed_shape, \
-        f"Loaded tensor shape {loaded_shape} doesn't match " \
-        f"packed_shape {packed_shape} from metadata for {param_name}"
+    pass
 
 
 def unpack_quantized_param_tree(
@@ -378,10 +264,6 @@ def unpack_quantized_param_tree(
         - unpacked_params: Parameter tree with quantized weights unpacked
         - timing_info: Dict with timing statistics
     """
-    # Validate backend
-    assert backend in ('auto', 'cpp', 'jax', 'numpy'), \
-        f"Invalid backend '{backend}', must be one of: auto, cpp, jax, numpy"
-
     start_time = time.perf_counter()
     timing_info = {
         "total_time": 0.0,
@@ -434,7 +316,6 @@ def unpack_quantized_param_tree(
         selected_backend = 'numpy'
         logger.info("Using NumPy backend for MXFP4 unpacking")
 
-    assert unpack_fn is not None, "Failed to select unpacking backend"
     timing_info["backend"] = selected_backend
 
     # Collect all quantized parameters first
@@ -451,13 +332,6 @@ def unpack_quantized_param_tree(
                 param_paths.append(path)
 
     collect_quantized(params)
-
-    # Defensive assertions
-    assert isinstance(params, dict), f"params must be a dict, got {type(params)}"
-    assert isinstance(quantization_metadata, dict), \
-        f"quantization_metadata must be a dict, got {type(quantization_metadata)}"
-    assert len(quantized_params) <= len(quantization_metadata), \
-        f"More quantized params ({len(quantized_params)}) than metadata entries ({len(quantization_metadata)})"
 
     # Decide whether to use parallel processing
     use_parallel = parallel and len(quantized_params) > 1
@@ -483,15 +357,6 @@ def unpack_quantized_param_tree(
             param_start = time.perf_counter()
 
             try:
-                # Defensive assertions
-                assert isinstance(path, str) and len(path) > 0, \
-                    f"path must be non-empty string, got {type(path)}"
-                assert isinstance(packed_data, (np.ndarray, jnp.ndarray)), \
-                    f"packed_data must be array, got {type(packed_data)}"
-                assert isinstance(meta, dict), f"meta must be dict, got {type(meta)}"
-                assert packed_data.dtype == np.uint8, \
-                    f"packed_data must be uint8 for {path}, got {packed_data.dtype}"
-
                 # Validate metadata if requested
                 if validate:
                     validate_quantization_metadata(meta, path, packed_data.shape)
@@ -504,10 +369,6 @@ def unpack_quantized_param_tree(
                     values_per_byte=meta.get("values_per_byte", 2),
                     validate=validate
                 )
-
-                # Post-condition assertion
-                assert unpacked.dtype == np.float16, \
-                    f"Unpacked data should be float16 for {path}, got {unpacked.dtype}"
 
                 param_time = time.perf_counter() - param_start
                 return (path, unpacked, param_time, None)

@@ -10,7 +10,9 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 import orbax.checkpoint as ocp
+import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec, Mesh
 
 # Import MXFP4 unpacking utilities
 from .mx_formats import unpack_quantized_param_tree
@@ -106,18 +108,100 @@ class OrbaxWeightLoader:
         Returns:
             Parameter tree compatible with JAX/Flax models
         """
+        import time
+
         # Check for state subdirectory (common Orbax structure)
         checkpoint_dir = self.checkpoint_path / "0"
         state_path = checkpoint_dir / "state"
         if state_path.exists() and (state_path / "_METADATA").exists():
             checkpoint_dir = state_path
 
+        # Detect platform for optimized loading strategy
+        platform = jax.default_backend()
+        is_gpu = platform in ('gpu', 'cuda', 'rocm', 'tpu')
+        target_device = jax.local_devices()[0]
+
         if show_progress:
             print(f"  Loading from: {checkpoint_dir}")
+            print(f"  JAX platform: {platform}")
+            print(f"  Target device: {target_device}")
 
-        # Load checkpoint
+        # Load checkpoint with device-agnostic sharding
+        # This works on both Mac (CPU) and GPU by specifying target sharding
         checkpointer = ocp.PyTreeCheckpointer()
-        params = checkpointer.restore(str(checkpoint_dir))
+
+        # Get checkpoint metadata to understand structure
+        try:
+            t_load_start = time.time()
+
+            # Read checkpoint metadata to get array shapes/dtypes
+            ckpt_metadata = checkpointer.metadata(str(checkpoint_dir))
+
+            if show_progress:
+                print(f"  Building device-agnostic restore spec...")
+
+            # Create a single-device sharding spec for all arrays
+            # This tells Orbax to ignore saved CUDA sharding and use our local device
+            from jax.sharding import SingleDeviceSharding
+
+            def build_restore_args(tree):
+                """Build restore args with single-device sharding for all arrays."""
+                if isinstance(tree, dict):
+                    return {k: build_restore_args(v) for k, v in tree.items()}
+                # For leaf nodes (arrays), specify single-device sharding
+                return ocp.ArrayRestoreArgs(sharding=SingleDeviceSharding(target_device))
+
+            restore_args = build_restore_args(ckpt_metadata)
+
+            if show_progress:
+                print(f"  Restoring checkpoint from disk...", flush=True)
+
+            # Restore with explicit sharding - this overrides the checkpoint's device info
+            params = checkpointer.restore(str(checkpoint_dir), args=restore_args)
+
+            t_load = time.time() - t_load_start
+            if show_progress:
+                print(f"  ✓ Orbax restore completed in {t_load:.2f}s", flush=True)
+
+        except Exception as e:
+            # Fallback for older Orbax versions or if metadata doesn't work
+            if show_progress:
+                print(f"  Note: Using direct restore (no sharding override)")
+            t_load_start = time.time()
+            params = checkpointer.restore(str(checkpoint_dir))
+            t_load = time.time() - t_load_start
+            if show_progress:
+                print(f"  ✓ Direct restore completed in {t_load:.2f}s")
+
+        # Platform-specific device placement
+        if is_gpu:
+            # GPU path: Use async device_put for fast host-to-device transfer
+            # This leverages fast PCIe bandwidth on GPU systems
+            if show_progress:
+                print(f"  Transferring to GPU...", flush=True)
+
+            t_transfer_start = time.time()
+
+            # Use device_put with async semantics for faster host-to-device transfer
+            params = jax.tree.map(
+                lambda x: jax.device_put(x, device=target_device),
+                params
+            )
+
+            # Block until transfer completes to get accurate timing
+            jax.tree.map(
+                lambda x: x.block_until_ready() if hasattr(x, 'block_until_ready') else x,
+                params
+            )
+
+            t_transfer = time.time() - t_transfer_start
+            if show_progress:
+                print(f"  ✓ GPU transfer completed in {t_transfer:.2f}s", flush=True)
+        else:
+            # CPU path: Data is already on the host, no transfer needed
+            # On macOS/CPU, arrays are already in the right place
+            if show_progress:
+                print(f"  ✓ Parameters loaded on CPU (no device transfer needed)")
 
         # Translate Orbax structure to JAX model structure
         if show_progress:

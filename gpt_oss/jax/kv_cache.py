@@ -4,9 +4,40 @@ Port of the PyTorch Triton implementation to JAX.
 Reference: gpt_oss/triton/model.py:121-154
 """
 
+import jax
 import jax.numpy as jnp
 from typing import Tuple
 from dataclasses import dataclass
+
+
+@jax.jit
+def _extend_jit(
+    k_cache: jnp.ndarray,
+    v_cache: jnp.ndarray,
+    k_new: jnp.ndarray,
+    v_new: jnp.ndarray,
+    offset: int
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """JIT-compiled KV cache extension (internal helper).
+
+    Uses jax.lax.dynamic_update_slice for JIT-compatible dynamic indexing.
+
+    Args:
+        k_cache: Current key cache [batch, max_ctx, n_heads, d_head]
+        v_cache: Current value cache [batch, max_ctx, n_heads, d_head]
+        k_new: New keys to add [batch, n_new, n_heads, d_head]
+        v_new: New values to add [batch, n_new, n_heads, d_head]
+        offset: Current cache offset
+
+    Returns:
+        Tuple of (new_k_cache, new_v_cache)
+    """
+    # Update cache using dynamic_update_slice (JIT-compatible)
+    # Start indices: [0, offset, 0, 0] for [batch, tokens, heads, head_dim]
+    new_k = jax.lax.dynamic_update_slice(k_cache, k_new, (0, offset, 0, 0))
+    new_v = jax.lax.dynamic_update_slice(v_cache, v_new, (0, offset, 0, 0))
+
+    return new_k, new_v
 
 
 @dataclass
@@ -82,6 +113,8 @@ class KVCache:
     def extend(self, k_new: jnp.ndarray, v_new: jnp.ndarray) -> Tuple['KVCache', jnp.ndarray, jnp.ndarray]:
         """Append new key-value pairs to cache and return full cache.
 
+        JIT-compiled for optimal performance.
+
         Args:
             k_new: New keys of shape [batch_size, n_new_tokens, n_kv_heads, d_head]
             v_new: New values of shape [batch_size, n_new_tokens, n_kv_heads, d_head]
@@ -125,14 +158,18 @@ class KVCache:
         assert self.offset + n_new_tokens <= self.k.shape[1], \
             f"Cache overflow: offset {self.offset} + {n_new_tokens} > max_ctx {self.k.shape[1]}"
 
-        # Update cache at [offset:offset+n_new_tokens]
-        new_k = self.k.at[:, self.offset:self.offset+n_new_tokens, :, :].set(k_new)
-        new_v = self.v.at[:, self.offset:self.offset+n_new_tokens, :, :].set(v_new)
+        # Call JIT-compiled helper for cache update
+        new_k, new_v = _extend_jit(
+            self.k, self.v, k_new, v_new, self.offset
+        )
 
-        # Create new cache with updated offset
-        new_cache = KVCache(k=new_k, v=new_v, offset=self.offset + n_new_tokens)
+        # Calculate new offset (outside JIT)
+        new_offset = self.offset + n_new_tokens
 
-        # Return cache and full K/V up to current offset
+        # Create new cache with updated values
+        new_cache = KVCache(k=new_k, v=new_v, offset=new_offset)
+
+        # Return full K/V up to current offset (slicing done outside JIT)
         k_full = new_k[:, :new_cache.offset, :, :]
         v_full = new_v[:, :new_cache.offset, :, :]
 

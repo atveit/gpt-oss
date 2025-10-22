@@ -25,6 +25,66 @@ except ImportError:
     from kv_cache import KVCache
 
 
+@jax.jit
+def _sample_token_jit(
+    logits: jax.Array,
+    temperature: float,
+    top_k: int,
+    rng_key: jax.Array
+) -> jax.Array:
+    """JIT-compiled token sampling (internal helper).
+
+    Args:
+        logits: Logits for next token prediction, shape [vocab_size]
+        temperature: Sampling temperature (0.0 = greedy)
+        top_k: Number of top tokens to consider (0 = all tokens)
+        rng_key: JAX random key
+
+    Returns:
+        Sampled token ID as jax.Array (scalar)
+    """
+    # Greedy vs temperature sampling using jax.lax.cond
+    def greedy_sample(logits):
+        return jnp.argmax(logits)
+
+    def temperature_sample(logits):
+        # Apply temperature scaling
+        scaled_logits = logits / jnp.maximum(temperature, 1e-8)  # Avoid div by zero
+
+        # Top-k filtering using jax.lax.cond
+        def apply_top_k(scaled_logits):
+            # Get top-k indices
+            top_k_indices = jnp.argsort(scaled_logits)[-top_k:]
+            # Create mask: -inf for non-top-k tokens
+            mask = jnp.full_like(scaled_logits, -jnp.inf)
+            mask = mask.at[top_k_indices].set(0.0)
+            return scaled_logits + mask
+
+        def no_top_k(scaled_logits):
+            return scaled_logits
+
+        # Apply top-k only if top_k > 0
+        scaled_logits = jax.lax.cond(
+            top_k > 0,
+            apply_top_k,
+            no_top_k,
+            scaled_logits
+        )
+
+        # Sample from categorical distribution
+        return jax.random.categorical(rng_key, scaled_logits)
+
+    # Use jax.lax.cond for greedy vs temperature sampling
+    token = jax.lax.cond(
+        temperature == 0.0,
+        greedy_sample,
+        temperature_sample,
+        logits
+    )
+
+    return token
+
+
 def sample_token(
     logits: jax.Array,
     temperature: float = 1.0,
@@ -32,6 +92,8 @@ def sample_token(
     rng_key: Optional[jax.Array] = None
 ) -> int:
     """Sample next token from logits.
+
+    JIT-compiled for optimal performance using jax.lax.cond for control flow.
 
     Args:
         logits: Logits for next token prediction, shape [vocab_size]
@@ -52,33 +114,20 @@ def sample_token(
     assert temperature >= 0.0, \
         f"sample_token: temperature must be non-negative, got {temperature}"
 
-    # Greedy sampling (argmax)
-    if temperature == 0.0:
-        return int(jnp.argmax(logits))
+    # For temperature sampling, rng_key is required
+    if temperature > 0.0 and rng_key is None:
+        raise ValueError("sample_token: rng_key required for temperature sampling (temperature > 0)")
 
-    # Temperature sampling
-    assert rng_key is not None, \
-        "sample_token: rng_key required for temperature sampling (temperature > 0)"
+    # Use dummy rng_key for greedy sampling (won't be used)
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(0)
 
-    # Apply temperature scaling
-    scaled_logits = logits / temperature
+    # Convert top_k to int (0 means no top_k filtering)
+    top_k_value = top_k if top_k is not None else 0
 
-    # Top-k filtering
-    if top_k is not None:
-        assert top_k > 0, f"sample_token: top_k must be positive, got {top_k}"
-        assert top_k <= len(logits), \
-            f"sample_token: top_k ({top_k}) > vocab_size ({len(logits)})"
+    # Call JIT-compiled helper
+    token = _sample_token_jit(logits, temperature, top_k_value, rng_key)
 
-        # Get top-k indices
-        top_k_indices = jnp.argsort(scaled_logits)[-top_k:]
-
-        # Create mask: -inf for non-top-k tokens
-        mask = jnp.full_like(scaled_logits, -jnp.inf)
-        mask = mask.at[top_k_indices].set(0.0)
-        scaled_logits = scaled_logits + mask
-
-    # Sample from categorical distribution
-    token = jax.random.categorical(rng_key, scaled_logits)
     return int(token)
 
 

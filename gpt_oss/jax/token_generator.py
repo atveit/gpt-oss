@@ -50,7 +50,6 @@ def load_config_from_checkpoint(checkpoint_path: Path) -> ModelConfig:
         ModelConfig instance
     """
     config_path = checkpoint_path / "config.json"
-    assert config_path.exists(), f"Config file not found: {config_path}"
 
     with open(config_path, 'r') as f:
         config_dict = json.load(f)
@@ -82,18 +81,20 @@ class TokenGenerator:
     interface compatible with the existing torch and triton backends.
     """
 
-    def __init__(self, checkpoint: str, max_context_length: int = 4096):
+    def __init__(self, checkpoint: str, max_context_length: int = 4096, force_cpu: bool = False):
         """Initialize JAX token generator.
 
         Args:
             checkpoint: Path to checkpoint directory (SafeTensors or Orbax format)
             max_context_length: Maximum context length for KV cache
+            force_cpu: If True, force CPU execution even if GPU is available.
+                      On macOS, this is automatically detected and not needed.
         """
-        # Force CPU execution
-        jax.config.update('jax_platform_name', 'cpu')
+        # Optionally force CPU execution (useful for testing or debugging)
+        if force_cpu:
+            jax.config.update('jax_platform_name', 'cpu')
 
         checkpoint_path = Path(checkpoint)
-        assert checkpoint_path.exists(), f"Checkpoint not found: {checkpoint}"
 
         # Load configuration
         self.config = load_config_from_checkpoint(checkpoint_path)
