@@ -1,9 +1,10 @@
-"""Orbax checkpoint loader for gpt-oss-20b.
+"""Orbax checkpoint loader for GPT-OSS models.
 
 This module provides fast weight loading from pre-converted Orbax checkpoints.
 Much faster than loading SafeTensors (5s vs 90s).
 
-Supports MXFP4 quantized weight unpacking for models like GPT-OSS-20B.
+Supports both gpt-oss-20b and gpt-oss-120b models, with MXFP4 quantized
+weight unpacking.
 """
 
 import json
@@ -243,37 +244,32 @@ class OrbaxWeightLoader:
 
 
 def load_config_from_orbax(checkpoint_path: str) -> Dict[str, Any]:
-    """Load model config inferred from Orbax checkpoint.
+    """Load model config from Orbax checkpoint directory.
 
-    Note: Orbax checkpoints don't include config.json,
-    so we return hardcoded config for gpt-oss-20b.
+    The Orbax conversion script (convert_checkpoint.py) saves config.json
+    alongside the checkpoint data. This function reads that config to support
+    both gpt-oss-20b (24 layers, 32 experts) and gpt-oss-120b (36 layers, 128 experts).
 
     Args:
-        checkpoint_path: Path to Orbax checkpoint
+        checkpoint_path: Path to Orbax checkpoint directory
 
     Returns:
         Dictionary with model configuration
+
+    Raises:
+        FileNotFoundError: If config.json is not found in checkpoint directory
     """
-    # For now, return the known gpt-oss-20b config
-    # In future, could infer from checkpoint structure
-    return {
-        "num_hidden_layers": 24,
-        "hidden_size": 2880,
-        "head_dim": 64,
-        "num_attention_heads": 64,
-        "num_key_value_heads": 8,
-        "sliding_window": 128,
-        "intermediate_size": 2880,
-        "num_experts": 32,
-        "experts_per_token": 4,
-        "vocab_size": 201088,
-        "swiglu_limit": 7.0,
-        "rope_theta": 150000.0,
-        "rope_scaling_factor": 32.0,
-        "rope_ntk_alpha": 1.0,
-        "rope_ntk_beta": 32.0,
-        "initial_context_length": 4096,
-    }
+    config_path = Path(checkpoint_path) / "config.json"
+
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"config.json not found in Orbax checkpoint: {config_path}\n"
+            f"If you converted this checkpoint with an older script, please re-convert using:\n"
+            f"  python -m gpt_oss.jax.scripts.convert_checkpoint --input <safetensors_dir> --output {checkpoint_path}"
+        )
+
+    with open(config_path, 'r') as f:
+        return json.load(f)
 
 
 if __name__ == "__main__":
